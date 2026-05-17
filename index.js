@@ -1,22 +1,33 @@
 // gmail.unread — Vodou lens for the Gmail inbox (latest unread).
 //
-// REQUIRES VODOU BRIDGE. Reads the user's actual Gmail tab via the extension's
-// `extract` verb so no OAuth, no API token, no MCP server is needed —
-// the user is already logged into Chrome.
+// REQUIRES VODOU BRIDGE. Reads the user's actual Gmail tab via the extension.
+// No OAuth, no API token, no MCP server — the user is already logged in.
 //
-// This lens is read-only in v1. Actions (archive, mark-read, reply) ship in v2
-// behind per-domain consent.
+// v2 ARCHITECTURE: opportunistic cache-first.
 //
-// Architecture note: Gmail uses heavy client-side JS, so we ask the Bridge to
-// `extract` from the current tab (where the DOM has already rendered) rather
-// than fetching mail.google.com server-HTML (which is a login-redirect shell).
+//   1. observe(): when the user is on mail.google.com, the Bridge extension
+//      runs the same DOM extractor every 30s while that tab is active and
+//      snapshots the inbox into chrome.storage.local under key
+//      `lens.gmail.unread`.
+//   2. fetch(): first reads ctx.extension.cacheGet('lens.gmail.unread').
+//      If a snapshot exists AND is < FRESH_MS old → return it. NO TAB OPENED.
+//      Otherwise falls back to extract (hidden tab) and writes the result
+//      to the cache so the next read is fast.
+//
+// Net effect: if the user has been on Gmail in the last 5 minutes, the
+// lens responds instantly with zero tab churn. If they haven't, it pays
+// the one-time hidden-tab cost.
+//
+// v1 is read-only. Actions (archive, reply) ship in v3 behind per-domain
+// consent.
 
 const manifest = {
   type: 'gmail.unread',
-  version: 1,
+  version: 2,
   motive:
     "Show the latest 10 unread emails from your Gmail inbox — sender, subject, " +
-    "snippet — by reading the page you're already logged into via Vodou Bridge.",
+    "snippet — by reading the page you're already logged into via Vodou Bridge. " +
+    "Uses an opportunistic cache so no tab is opened when you've recently visited Gmail.",
   url_patterns: [
     'mail.google.com/mail/u/*/#inbox',
     'mail.google.com/mail/u/*/#search/is:unread',
@@ -37,33 +48,32 @@ const manifest = {
   extracts: ['count', 'messages'],
 };
 
-// Default tab to read when the user invokes the lens without a URL.
-// Anchor to mail.google.com/mail/u/0/#inbox so we hit the primary account.
+// Snapshot freshness window. If the cache is older than this, refresh
+// via extract. 5 min is a reasonable balance — short enough that you
+// don't get truly stale unread counts, long enough that walking away
+// from your computer for a meeting doesn't trigger a tab open.
+const FRESH_MS = 5 * 60 * 1000;
+
+// Cache key — namespaced under "lens." so it doesn't collide with other
+// extension storage usage.
+const CACHE_KEY = 'lens.gmail.unread';
+
 const DEFAULT_INBOX_URL = 'https://mail.google.com/mail/u/0/#inbox';
 
-// Extract function injected into the Gmail tab. Runs in the page's context
-// where the DOM is already rendered. Returns a serializable result.
-//
-// Gmail's inbox uses table rows with role="row" and class containing "zE"
-// (unread) vs "zA" (read). Subject is in [data-thread-id] td:nth-child(5).
-// Selectors are intentionally tolerant — Gmail's class names change but
-// the role/aria-label structure is more stable.
+// Extractor function — runs in the Gmail page context. Same as v1.
+// Returns a serializable result. See README for selector reasoning.
 function extractInboxFn() {
   const out = { count: 0, messages: [] };
-  // Find the inbox table.
   const rows = Array.from(
     document.querySelectorAll('tr[role="row"], div[role="link"]')
   ).filter((r) => r.closest('[role="grid"], [role="main"]'));
   let unreadOnly = rows.filter((r) => {
     const cls = r.className || '';
-    // Heuristic: unread rows include "zE" class on classic Gmail; bold subject on new UI.
     return /\bzE\b/.test(cls) || r.querySelector('.zF, b, strong');
   });
-  // If we couldn't tell read-vs-unread (UI variant), fall back to first N rows.
   if (unreadOnly.length === 0) unreadOnly = rows;
   out.count = unreadOnly.length;
   for (const row of unreadOnly.slice(0, 10)) {
-    // Sender: span[email] or span[name] in the leftmost name cell.
     const senderEl = row.querySelector(
       'span[email], span[name], .yX .yW span[email], .bA4 span'
     );
@@ -72,17 +82,14 @@ function extractInboxFn() {
       senderEl?.getAttribute('name') ||
       senderEl?.textContent?.trim() ||
       '(unknown)';
-    // Subject + snippet are in the same cell; subject is bold/strong, snippet is the rest.
     const subjectEl = row.querySelector(
       '.bog, .y6 span:first-child, [data-thread-id] [role="link"] > span'
     );
     const subject = subjectEl?.textContent?.trim() || '(no subject)';
-    // Snippet text after "—" or in a sibling.
     const snippetEl = row.querySelector('.y2, .bog + span, .bA0');
     let snippet = snippetEl?.textContent?.trim() || '';
     if (snippet.startsWith('—')) snippet = snippet.slice(1).trim();
     snippet = snippet.replace(/\s+/g, ' ').slice(0, 140);
-    // Time
     const timeEl = row.querySelector(
       '.xW span[title], .xW, td[role="gridcell"] [title]'
     );
@@ -97,12 +104,29 @@ export const card = {
   manifest,
 
   validate(_payload, sourceUrl) {
-    // Accept any mail.google.com URL or no URL (we'll default to inbox).
     if (!sourceUrl) return true;
     try {
       return new URL(sourceUrl).hostname.endsWith('mail.google.com');
     } catch {
       return false;
+    }
+  },
+
+  /**
+   * observe() — Vodou's ambient hook. When the user is on a matching tab,
+   * the extension calls this so we can update our snapshot cache. The
+   * implementation: extract the inbox, write to cache. The extension batches
+   * calls (≥30s apart per tab) so this stays cheap.
+   */
+  async observe(sourceUrl, ctx) {
+    if (!ctx.extension) return;
+    try {
+      const result = await ctx.extension.extract(sourceUrl, extractInboxFn);
+      if (result && typeof result === 'object') {
+        await ctx.extension.cacheSet(CACHE_KEY, result);
+      }
+    } catch {
+      // Observe failures are silent — the user didn't ask for anything.
     }
   },
 
@@ -112,12 +136,31 @@ export const card = {
         'gmail.unread requires Vodou Bridge. Install the Chrome extension from extension/vodou-bridge/ and click Connect.'
       );
     }
+    // 1. Try the cache first. The whole point of v2.
+    try {
+      const cached = await ctx.extension.cacheGet(CACHE_KEY);
+      if (
+        cached &&
+        typeof cached.updated_at === 'number' &&
+        Date.now() - cached.updated_at < FRESH_MS
+      ) {
+        const v = cached.value || {};
+        return {
+          count: typeof v.count === 'number' ? v.count : (v.messages || []).length,
+          messages: Array.isArray(v.messages) ? v.messages.slice(0, 10) : [],
+          _cache_age_ms: Date.now() - cached.updated_at,
+          _source: 'cache',
+        };
+      }
+    } catch {
+      // Cache layer down — fall through to extract.
+    }
+
+    // 2. Fallback: hidden-tab extract. Pays the tab-open cost once; result
+    // is written to cache so the next read is fast.
     const url = sourceUrl && sourceUrl.includes('mail.google.com')
       ? sourceUrl
       : DEFAULT_INBOX_URL;
-    // Bridge `extract` opens (or reuses) a tab matching the URL pattern
-    // and runs the function in the page context. The user's session cookies
-    // are present — Gmail renders as normal.
     let result;
     try {
       result = await ctx.extension.extract(url, extractInboxFn);
@@ -130,9 +173,19 @@ export const card = {
     if (!result || typeof result !== 'object') {
       return { count: 0, messages: [] };
     }
-    return {
+    const normalized = {
       count: typeof result.count === 'number' ? result.count : (result.messages || []).length,
       messages: Array.isArray(result.messages) ? result.messages.slice(0, 10) : [],
+    };
+    // Seed the cache so subsequent calls hit the fast path.
+    try {
+      await ctx.extension.cacheSet(CACHE_KEY, normalized);
+    } catch {
+      // Cache write failure is non-fatal.
+    }
+    return {
+      ...normalized,
+      _source: 'extract',
     };
   },
 };
