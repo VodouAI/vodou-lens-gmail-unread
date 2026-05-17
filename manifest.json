@@ -1,0 +1,23 @@
+{
+  "type": "gmail.unread",
+  "version": 1,
+  "motive": "Show the latest 10 unread emails from your Gmail inbox — sender, subject, snippet — by reading the page you're already logged into via Vodou Bridge.",
+  "url_patterns": [
+    "mail.google.com/mail/u/*/#inbox",
+    "mail.google.com/mail/u/*/#search/is:unread",
+    "mail.google.com/**"
+  ],
+  "ttl_seconds": 60,
+  "requires": {
+    "network_domains": ["mail.google.com"],
+    "runs_js": false,
+    "paths": ["bridge"],
+    "cookie_scope": "session",
+    "needs_session": true
+  },
+  "icon": "📩",
+  "category": "communication",
+  "author": "@vodou",
+  "license": "MIT",
+  "extracts": ["count", "messages"]
+}
