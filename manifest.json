@@ -1,6 +1,6 @@
 {
   "type": "gmail.unread",
-  "version": 4,
+  "version": 5,
   "motive": "Show the latest 10 unread emails from your Gmail inbox — sender, subject, snippet — by reading the page you're already logged into via Vodou Bridge.",
   "url_patterns": [
     "mail.google.com/mail/u/*/#inbox",
@@ -19,5 +19,5 @@
   "category": "communication",
   "author": "@vodou",
   "license": "MIT",
-  "extracts": ["count", "messages", "diagnostic"]
+  "extracts": ["count", "messages", "diagnostic", "error"]
 }
