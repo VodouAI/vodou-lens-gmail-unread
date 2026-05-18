@@ -1,6 +1,6 @@
 {
   "type": "gmail.unread",
-  "version": 3,
+  "version": 4,
   "motive": "Show the latest 10 unread emails from your Gmail inbox — sender, subject, snippet — by reading the page you're already logged into via Vodou Bridge. Uses an opportunistic cache so no tab is opened when you've recently visited Gmail.",
   "url_patterns": [
     "mail.google.com/mail/u/*/#inbox",
