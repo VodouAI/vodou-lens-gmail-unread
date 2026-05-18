@@ -13,7 +13,7 @@
 
 const manifest = {
   type: 'gmail.unread',
-  version: 6,
+  version: 7,
   motive:
     "Show the latest 10 unread emails from your Gmail inbox — sender, " +
     "subject, snippet — by reading the page you're already logged into " +
