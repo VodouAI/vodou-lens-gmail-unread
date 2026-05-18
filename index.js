@@ -13,7 +13,7 @@
 
 const manifest = {
   type: 'gmail.unread',
-  version: 7,
+  version: 8,
   motive:
     "Show the latest 10 unread emails from your Gmail inbox — sender, " +
     "subject, snippet — by reading the page you're already logged into " +
@@ -44,6 +44,34 @@ const EXTRACTOR_ID = 'gmail.unread';
 
 export const card = {
   manifest,
+
+  // Row-click action: navigate the user's existing Gmail tab to the thread
+  // URL in place. Uses Bridge openUrl with match_url so the user lands in
+  // their already-logged-in session, not a fresh popup.
+  actions: {
+    open_thread: {
+      label: 'Open email',
+      requiresConsent: false,
+      async run(_model, ctx) {
+        const url =
+          (ctx && ctx.payload && ctx.payload.url) ||
+          (ctx && ctx.sourceUrl) ||
+          '';
+        if (!url) return { ok: false, message: 'no URL provided' };
+        if (!ctx.extension || typeof ctx.extension.openUrl !== 'function') {
+          return { ok: false, message: 'Vodou Bridge not connected' };
+        }
+        try {
+          const r = await ctx.extension.openUrl(url, {
+            match_url: 'https://mail.google.com/*',
+          });
+          return { ok: true, message: r.reused ? 'navigated existing Gmail tab' : 'opened new tab' };
+        } catch (e) {
+          return { ok: false, message: String(e && e.message || e) };
+        }
+      },
+    },
+  },
 
   validate(_payload, sourceUrl) {
     if (!sourceUrl) return true;
