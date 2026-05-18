@@ -1,16 +1,23 @@
 // gmail.unread — Vodou lens for the Gmail inbox (latest unread).
 //
-// v5 — bulletproof extractor (no exceptions reach the bridge), surfaces
-// extractor errors to the lens caller, and lowers the bar for what counts
-// as a "row" so we don't return empty against a fully-rendered inbox.
+// v6 — uses the extension's CSP-safe `extract_builtin` verb. Gmail
+// ships strict Content Security Policy headers that block `new Function()`
+// (the mechanism `act_in_tab` relied on for arbitrary scripts). The
+// extension's BUILTIN_EXTRACTORS registry has a hardcoded Gmail extractor
+// dispatched via chrome.scripting.executeScript({func: realFn}), which
+// uses Chrome's privileged injection path and bypasses CSP eval rules.
+//
+// Trade-off: the extractor lives in the extension, not the lens.
+// Community contributors who want a new CSP-strict site PR the extractor
+// function into extension/vodou-bridge/background.js.
 
 const manifest = {
   type: 'gmail.unread',
-  version: 5,
+  version: 6,
   motive:
     "Show the latest 10 unread emails from your Gmail inbox — sender, " +
     "subject, snippet — by reading the page you're already logged into " +
-    "via Vodou Bridge.",
+    "via Vodou Bridge. Uses the extension's CSP-safe built-in extractor.",
   url_patterns: [
     'mail.google.com/mail/u/*/#inbox',
     'mail.google.com/mail/u/*/#search/is:unread',
@@ -33,147 +40,7 @@ const manifest = {
 
 const FRESH_MS = 60 * 1000;
 const CACHE_KEY = 'lens.gmail.unread';
-const GMAIL_TAB_PATTERN = 'https://mail.google.com/*';
-
-// The page-context extractor. Every code path is try/wrapped so the bridge
-// receives a structured result, never `{error: ...}` from runUserScript's
-// outer catch (which would lose diagnostic info).
-function buildExtractScript() {
-  return `(function () {
-    try {
-      const dbg = {
-        url: location.href,
-        ready: document.readyState,
-        title: document.title,
-        variants: [],
-        row_count: 0,
-        unread_count: 0,
-      };
-
-      function findRows() {
-        const main = document.querySelector('div[role="main"]');
-        dbg.has_role_main = !!main;
-        const scopes = [main || document.body];
-        const tryQ = function (q, label) {
-          for (let s = 0; s < scopes.length; s++) {
-            try {
-              const r = scopes[s].querySelectorAll(q);
-              dbg.variants.push(label + ':' + r.length);
-              if (r.length > 0) return Array.from(r);
-            } catch (e) { dbg.variants.push(label + ':err'); }
-          }
-          return [];
-        };
-        let r = tryQ('tr[role="row"]', 'tr-role-row');
-        if (r.length === 0) r = tryQ('[role="row"]', 'any-role-row');
-        if (r.length === 0) r = tryQ('div[gh="tl"] [role="row"]', 'gh-tl-row');
-        if (r.length === 0) r = tryQ('table.F.cf.zt tr', 'classic-tbl');
-        if (r.length === 0) r = tryQ('li[role="listitem"]', 'listitem');
-        return r;
-      }
-
-      const rows = findRows();
-      dbg.row_count = rows.length;
-      if (rows.length === 0) {
-        const main = document.querySelector('div[role="main"]');
-        if (main) {
-          dbg.main_first_child_tag = main.firstElementChild ? main.firstElementChild.tagName : null;
-          dbg.main_preview = (main.innerText || '').slice(0, 200);
-        } else {
-          dbg.body_preview = (document.body.innerText || '').slice(0, 200);
-        }
-        return { count: 0, messages: [], diagnostic: dbg };
-      }
-
-      function isUnread(row) {
-        try {
-          if (/\\bzE\\b/.test(row.className || '')) return true;
-          // computed style on a few text-bearing descendants
-          const els = row.querySelectorAll('span, div, b, strong');
-          for (let i = 0; i < Math.min(els.length, 8); i++) {
-            try {
-              const w = getComputedStyle(els[i]).fontWeight;
-              if (parseInt(w, 10) >= 600) return true;
-              if (w === 'bold' || w === 'bolder') return true;
-            } catch (_) { /* skip */ }
-          }
-        } catch (_) { /* skip */ }
-        return false;
-      }
-
-      const unread = rows.filter(isUnread);
-      dbg.unread_count = unread.length;
-      const target = unread.length > 0 ? unread : rows.slice(0, 10);
-
-      function extractRow(row) {
-        let sender = '';
-        try {
-          const emailSpan = row.querySelector('span[email], span[name]');
-          if (emailSpan) {
-            sender =
-              emailSpan.getAttribute('email') ||
-              emailSpan.getAttribute('name') ||
-              (emailSpan.textContent && emailSpan.textContent.trim()) ||
-              '';
-          }
-        } catch (_) {}
-        if (!sender) {
-          try {
-            const cells = row.querySelectorAll('[role="gridcell"]');
-            for (let i = 0; i < Math.min(cells.length, 4); i++) {
-              const t = (cells[i].textContent || '').trim();
-              if (t && t.length > 0 && t.length < 80) {
-                sender = t;
-                break;
-              }
-            }
-          } catch (_) {}
-        }
-        if (!sender) sender = '(unknown)';
-
-        let longest = '';
-        try {
-          const cells = row.querySelectorAll('[role="gridcell"], td, div');
-          for (let i = 0; i < Math.min(cells.length, 20); i++) {
-            const text = (cells[i].textContent || '').trim();
-            if (text.length > longest.length && text !== sender) longest = text;
-          }
-        } catch (_) {}
-        let subject = '';
-        let snippet = '';
-        const dashIdx = longest.indexOf('—');
-        if (dashIdx > 0) {
-          subject = longest.slice(0, dashIdx).trim();
-          snippet = longest.slice(dashIdx + 1).trim();
-        } else {
-          subject = longest.slice(0, 120).trim();
-          snippet = longest.slice(120, 280).trim();
-        }
-        if (!subject) subject = '(no subject)';
-        snippet = snippet.replace(/\\s+/g, ' ').slice(0, 140);
-
-        let time = '';
-        try {
-          const timeEl = row.querySelector('[title]');
-          time =
-            (timeEl && timeEl.getAttribute && timeEl.getAttribute('title')) ||
-            (timeEl && timeEl.textContent && timeEl.textContent.trim()) ||
-            '';
-        } catch (_) {}
-        return { sender: sender, subject: subject, snippet: snippet, time: time };
-      }
-
-      const messages = [];
-      for (let i = 0; i < Math.min(target.length, 10); i++) {
-        try { messages.push(extractRow(target[i])); }
-        catch (e) { dbg.extract_errors = (dbg.extract_errors || []); dbg.extract_errors.push(String(e && e.message || e)); }
-      }
-      return { count: messages.length, messages: messages, diagnostic: dbg };
-    } catch (e) {
-      return { count: 0, messages: [], error: String((e && e.message) || e), diagnostic: { trapped: true } };
-    }
-  })()`;
-}
+const EXTRACTOR_ID = 'gmail.unread';
 
 export const card = {
   manifest,
@@ -191,6 +58,11 @@ export const card = {
     if (!ctx.extension) {
       throw new Error(
         'gmail.unread requires Vodou Bridge. Install the Chrome extension from extension/vodou-bridge/ and click Connect.'
+      );
+    }
+    if (typeof ctx.extension.extractBuiltin !== 'function') {
+      throw new Error(
+        'gmail.unread requires Vodou Bridge v0.5.91.1 or later (extract_builtin verb). Reload the extension at chrome://extensions.'
       );
     }
 
@@ -214,10 +86,10 @@ export const card = {
       }
     } catch { /* miss */ }
 
+    // CSP-safe extract via the extension's built-in.
     let result;
     try {
-      const res = await ctx.extension.actInTab(GMAIL_TAB_PATTERN, buildExtractScript());
-      result = res && res.result;
+      result = await ctx.extension.extractBuiltin(EXTRACTOR_ID);
     } catch (err) {
       const msg = err && (err.message || String(err));
       if (msg && /NO_MATCHING_TAB/i.test(msg)) {
@@ -225,7 +97,12 @@ export const card = {
           'Open a Gmail tab and try again — gmail.unread reads your existing logged-in tab, so https://mail.google.com/ must be open in Chrome.'
         );
       }
-      throw new Error(`Vodou Bridge actInTab failed: ${msg}`);
+      if (msg && /UNKNOWN_EXTRACTOR/i.test(msg)) {
+        throw new Error(
+          "Vodou Bridge doesn't know the 'gmail.unread' extractor. Reload the extension at chrome://extensions (need v0.5.91.1+)."
+        );
+      }
+      throw new Error(`Vodou Bridge extract_builtin failed: ${msg}`);
     }
 
     if (!result || typeof result !== 'object') {
@@ -234,7 +111,6 @@ export const card = {
       );
     }
 
-    // Surface the extractor's own error if present (helps tune selectors).
     if (result.error) {
       throw new Error(
         `gmail.unread extractor error: ${result.error} (diagnostic: ${JSON.stringify(result.diagnostic || {})})`
@@ -251,6 +127,6 @@ export const card = {
       try { await ctx.extension.cacheSet(CACHE_KEY, normalized); } catch { /* non-fatal */ }
     }
 
-    return { ...normalized, _source: 'actInTab' };
+    return { ...normalized, _source: 'extract_builtin' };
   },
 };
